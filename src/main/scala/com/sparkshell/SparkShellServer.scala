@@ -30,7 +30,7 @@ class SparkShellServer(spark: SparkSession, port: Int) {
       Thread.currentThread().join()
     } catch {
       case _: InterruptedException =>
-        println("Server interrupted, shutting down...")
+        System.err.println("Server interrupted, shutting down...")
     }
   }
 }
@@ -49,16 +49,33 @@ object SparkShellServer {
         "org.apache.spark.sql.delta.serverSidePlanning.ServerSidePlanningClientFactory")
       val setFactory = registryClass.getMethod("setFactory", factoryClass)
       setFactory.invoke(null, factoryInstance)
-      println("Registered IcebergRESTCatalogPlanningClientFactory for server-side planning")
+      System.err.println("Registered IcebergRESTCatalogPlanningClientFactory for server-side planning")
     } catch {
       case _: ClassNotFoundException =>
-        println("Server-side planning classes not found; skipping FGAC planning client registration")
+        System.err.println("Server-side planning classes not found; skipping FGAC planning client registration")
       case e: Exception =>
-        println(s"Warning: failed to register server-side planning client factory: ${e.getMessage}")
+        System.err.println(s"Warning: failed to register server-side planning client factory: ${e.getMessage}")
     }
   }
 
   def main(args: Array[String]): Unit = {
+    // Redirect System.out to a file so Log4j's ConsoleAppender (which
+    // targets stdout by default) can never block on a full pipe buffer.
+    // When the parent process captures our stdout via a pipe, a slow reader
+    // causes FileOutputStream.writeBytes to block in the kernel while
+    // holding PrintStream's ReentrantLock — deadlocking every thread that
+    // tries to print, including HTTP handler threads.
+    // We keep stderr for our own diagnostic output (see RestApi.log).
+    val logDir = sys.env.getOrElse("SPARKSHELL_LOG_DIR",
+      System.getProperty("java.io.tmpdir"))
+    val stdoutLog = new java.io.File(logDir, "sparkshell_stdout.log")
+    val stdoutStream = new java.io.PrintStream(
+      new java.io.BufferedOutputStream(
+        new java.io.FileOutputStream(stdoutLog, true)),
+      true)
+    System.setOut(stdoutStream)
+    System.err.println(s"[SparkShellServer] stdout redirected to ${stdoutLog.getAbsolutePath}")
+
     // Parse arguments: port [key1=value1 key2=value2 ...]
     val port = if (args.length > 0) args(0).toInt else DEFAULT_PORT
     val sparkConfigs = if (args.length > 1) {
@@ -89,7 +106,7 @@ object SparkShellServer {
     
     // Apply custom Spark configurations
     val builderWithConfigs = sparkConfigs.foldLeft(builder) { case (b, (key, value)) =>
-      println(s"Applying custom Spark config: $key = $value")
+      System.err.println(s"Applying custom Spark config: $key = $value")
       b.config(key, value)
     }
     
@@ -97,27 +114,29 @@ object SparkShellServer {
 
     spark.sparkContext.setLogLevel("WARN")
 
+    def log(msg: String): Unit = System.err.println(msg)
+
     // Print version information
-    println("=" * 60)
-    println("Runtime Configuration:")
-    println(s"  Spark:           ${spark.version}")
+    log("=" * 60)
+    log("Runtime Configuration:")
+    log(s"  Spark:           ${spark.version}")
 
     // Get Delta Lake version
     try {
       val deltaVersion = io.delta.VERSION
-      println(s"  Delta Lake:      $deltaVersion")
+      log(s"  Delta Lake:      $deltaVersion")
     } catch {
-      case _: Exception => println(s"  Delta Lake:      enabled (version unknown)")
+      case _: Exception => log(s"  Delta Lake:      enabled (version unknown)")
     }
 
     // Check Unity Catalog
     if (sparkConfigs.contains("spark.sql.catalog.unity.uri") &&
         sparkConfigs.contains("spark.sql.catalog.unity.token")) {
-      println(s"  Unity Catalog:   enabled (${sparkConfigs("spark.sql.catalog.unity.uri")})")
+      log(s"  Unity Catalog:   enabled (${sparkConfigs("spark.sql.catalog.unity.uri")})")
     } else {
-      println(s"  Unity Catalog:   available (not configured)")
+      log(s"  Unity Catalog:   available (not configured)")
     }
-    println("=" * 60)
+    log("=" * 60)
 
     // Register server-side planning client factory for FGAC support (when available).
     tryRegisterServerSidePlanningFactory()
@@ -125,10 +144,10 @@ object SparkShellServer {
     // Eagerly initialize Spark internals to avoid lazy loading issues
     try {
       spark.sql("SELECT 1").collect()
-      println("Spark internals pre-initialized successfully")
+      log("Spark internals pre-initialized successfully")
     } catch {
       case e: Exception =>
-        println(s"Warning during Spark pre-initialization: ${e.getMessage}")
+        log(s"Warning during Spark pre-initialization: ${e.getMessage}")
     }
 
     // Start REST API Server

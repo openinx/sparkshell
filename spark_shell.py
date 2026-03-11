@@ -265,6 +265,8 @@ class SparkShell:
         self.process: Optional[subprocess.Popen] = None
         self.jar_path: Optional[Path] = None
         self.is_ready = False
+        self._log_handle = None
+        self._log_thread = None
 
         # Tee: all print output is also written to a log file
         self._original_stdout: Optional[object] = None
@@ -1327,28 +1329,41 @@ class SparkShell:
         if self.op_config.verbose:
             print(f"[SparkShell] Running: {' '.join(cmd)}")
 
-        # Always write to log file for diagnostics, but also show in verbose mode
-        with open(log_file, "w") as log:
-            if self.op_config.verbose:
-                # In verbose mode, use Popen to read output continuously
-                self.process = subprocess.Popen(
-                    cmd,
-                    cwd=self.work_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    preexec_fn=os.setsid if sys.platform != "win32" else None
-                )
-            else:
-                # In quiet mode, redirect to log file only
-                self.process = subprocess.Popen(
-                    cmd,
-                    cwd=self.work_dir,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    preexec_fn=os.setsid if sys.platform != "win32" else None
-                )
+        # Keep the log file open for the lifetime of the server process so
+        # output is always captured.  A background thread drains stdout so
+        # the OS pipe buffer never fills up (which would block the JVM).
+        import threading
+
+        self._log_handle = open(log_file, "w")
+
+        self.process = subprocess.Popen(
+            cmd,
+            cwd=self.work_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            preexec_fn=os.setsid if sys.platform != "win32" else None,
+        )
+
+        def _drain_stdout():
+            """Continuously read server stdout, write to log file (and print in verbose mode)."""
+            try:
+                for line in self.process.stdout:
+                    self._log_handle.write(line)
+                    self._log_handle.flush()
+                    if self.op_config.verbose:
+                        print(line, end='')
+            except (ValueError, OSError):
+                pass
+            finally:
+                try:
+                    self._log_handle.close()
+                except (ValueError, OSError):
+                    pass
+
+        self._log_thread = threading.Thread(target=_drain_stdout, daemon=True)
+        self._log_thread.start()
 
         # Wait for server to be ready
         self._debug("start: waiting up to", self.op_config.startup_timeout, "s for server")
@@ -1356,27 +1371,6 @@ class SparkShell:
         start_time = time.time()
 
         while time.time() - start_time < self.op_config.startup_timeout:
-            # In verbose mode, read and display output from the process
-            if self.op_config.verbose and self.process.stdout:
-                try:
-                    import select
-                    # Use select to check if there's data to read (non-blocking)
-                    if sys.platform != "win32":
-                        ready, _, _ = select.select([self.process.stdout], [], [], 0.1)
-                        if ready:
-                            line = self.process.stdout.readline()
-                            if line:
-                                print(line, end='')
-                                # Also write to log file
-                                with open(log_file, "a") as log:
-                                    log.write(line)
-                    else:
-                        # Windows doesn't support select on pipes, use readline with timeout
-                        # This is a simplified approach for Windows
-                        pass
-                except:
-                    pass
-
             if self._check_health():
                 self.is_ready = True
                 self._debug("start: server health check passed, is_ready=True")
@@ -1554,6 +1548,15 @@ class SparkShell:
         except Exception as e:
             print(f"[SparkShell] Error during shutdown: {e}")
         finally:
+            if hasattr(self, '_log_thread') and self._log_thread is not None:
+                self._log_thread.join(timeout=5)
+                self._log_thread = None
+            if hasattr(self, '_log_handle') and self._log_handle is not None:
+                try:
+                    self._log_handle.close()
+                except (ValueError, OSError):
+                    pass
+                self._log_handle = None
             self.process = None
             self.is_ready = False
     

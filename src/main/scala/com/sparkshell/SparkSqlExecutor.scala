@@ -5,6 +5,8 @@ import scala.util.{Try, Success, Failure}
 
 class SparkSqlExecutor(spark: SparkSession) {
 
+  private def log(msg: String): Unit = System.err.println(msg)
+
   def executeSql(sqlQuery: String, outputPath: Option[String] = None): SqlResult = {
     Try {
       val df = spark.sql(sqlQuery)
@@ -104,7 +106,7 @@ class SparkSqlExecutor(spark: SparkSession) {
       val rowCount = cachedDf.count()
       
       // Write to Parquet
-      println(s"Writing ${rowCount} rows to Parquet at: $outputPath")
+      log(s"Writing ${rowCount} rows to Parquet at: $outputPath")
       cachedDf.write
         .mode("overwrite")  // Overwrite if exists
         .parquet(outputPath)
