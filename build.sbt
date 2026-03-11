@@ -8,7 +8,12 @@ scalaVersion := "2.13.15"
 val deltaVersion = sys.env.getOrElse("DELTA_VERSION", "4.0.0")
 val deltaUseLocal = sys.env.getOrElse("DELTA_USE_LOCAL", "false").toBoolean
 val deltaSparkVersion = sys.env.getOrElse("DELTA_SPARK_VERSION", "")
-val deltaArtifactSuffix = if (deltaSparkVersion.startsWith("4.0")) Some("4.0") else None
+// Delta CrossSparkVersions publishes delta-spark_4.0_2.13, delta-spark_4.1_2.13, etc.
+val deltaArtifactSuffix =
+  if (deltaSparkVersion.startsWith("4.2")) Some("4.2")
+  else if (deltaSparkVersion.startsWith("4.1")) Some("4.1")
+  else if (deltaSparkVersion.startsWith("4.0")) Some("4.0")
+  else None
 val deltaSparkModule = deltaArtifactSuffix.map(s => s"delta-spark_" + s).getOrElse("delta-spark")
 val deltaIcebergModule = deltaArtifactSuffix.map(s => s"delta-iceberg_" + s).getOrElse("delta-iceberg")
 val deltaSupportsIceberg = !deltaSparkVersion.startsWith("4.1") && !deltaSparkVersion.startsWith("4.2")
@@ -20,11 +25,14 @@ val deltaSupportsIceberg = !deltaSparkVersion.startsWith("4.1") && !deltaSparkVe
 val ucUseLocal = sys.env.getOrElse("UC_USE_LOCAL", "false").toBoolean
 val ucVersion = if (ucUseLocal) "0.5.0-SNAPSHOT" else "0.3.1"
 
-// When using local Delta or UC: include Maven local so ~/.m2 snapshots are available.
-// Both Delta and UC publish to ~/.m2 via publishM2.
-// Keep it after normal repositories to avoid shadowing stable transitive dependencies.
+// When using local Delta or UC: resolve from Maven local. Use maven.repo.local when set
+// (e.g. by SparkShell for a temp repo under work_dir/m2_repo) so the build is reproducible.
 val needsMavenLocal = deltaUseLocal || ucUseLocal
-resolvers := resolvers.value ++ (if (needsMavenLocal) Seq(Resolver.mavenLocal) else Seq.empty)
+val localMavenRepo =
+  sys.props.get("maven.repo.local").fold(Resolver.mavenLocal)(p =>
+    MavenRepository("local", "file://" + new java.io.File(p).getAbsolutePath)
+  )
+resolvers := resolvers.value ++ (if (needsMavenLocal) Seq(localMavenRepo) else Seq.empty)
 
 // Main class for easy running
 Compile / mainClass := Some("com.sparkshell.SparkShellServer")

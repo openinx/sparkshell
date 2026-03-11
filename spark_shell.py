@@ -484,12 +484,102 @@ class SparkShell:
         print(f"[SparkShell] Delta repository ready: {delta_dir}")
         return delta_dir
 
+    def _get_maven_local_env(self) -> dict:
+        """
+        Build env for all SBT builds (Delta, UC, SparkShell).
+
+        Sets JAVA_HOME to JDK 17 (required by Spark 4.x) and SBT_OPTS so that
+        publishM2 and resolution use a temp Maven repo under work_dir/m2_repo.
+        """
+        env: dict[str, str] = {}
+
+        # Spark 4.x requires JDK 17+; the system default may be JDK 11.
+        java17 = "/usr/lib/jvm/java-17-openjdk-amd64"
+        env["JAVA_HOME"] = os.environ.get("JAVA_HOME", java17)
+        env["PATH"] = os.path.join(env["JAVA_HOME"], "bin") + ":" + os.environ.get("PATH", "")
+
+        if getattr(self, "_m2_repo", None) and self._m2_repo:
+            m2 = str(Path(self._m2_repo).resolve())
+            opts = os.environ.get("SBT_OPTS", "")
+            if "-Dmaven.repo.local=" not in opts:
+                opts = f"{opts} -Dmaven.repo.local={m2}".strip()
+            env["SBT_OPTS"] = opts
+
+        return env
+
+    def _patch_sbt_for_temp_repo(self, project_dir: Path):
+        """
+        Patch a project's build/sbt so all publishM2 and resolution uses the temp repo.
+
+        Many build/sbt scripts (from Delta, SparkShell) unconditionally overwrite SBT_OPTS,
+        destroying -Dmaven.repo.local set by _get_maven_local_env(). Additionally, they set
+        -Dsbt.override.build.repos=true which ignores build.sbt resolvers.
+
+        This method fixes both issues for any project dir that has build/sbt:
+        1. Patches build/sbt to append to SBT_OPTS instead of overwriting.
+        2. Injects the temp Maven repo into sbt-config/repositories.
+
+        Only patches directories under work_dir (temp copies we own). User-provided
+        source_dir paths are never modified; a warning is emitted if a clobbering
+        pattern is detected there.
+        """
+        if not getattr(self, "_m2_repo", None) or not self._m2_repo:
+            return
+        if not self.work_dir:
+            return
+
+        project_dir = Path(project_dir).resolve()
+        work_dir_resolved = Path(self.work_dir).resolve()
+
+        # Safety: never modify files outside our temp work_dir.
+        if not str(project_dir).startswith(str(work_dir_resolved)):
+            sbt_script = project_dir / "build" / "sbt"
+            if sbt_script.exists():
+                content = sbt_script.read_text()
+                if 'export SBT_OPTS="-D' in content and '${SBT_OPTS}' not in content:
+                    print(
+                        f"[SparkShell] WARNING: {sbt_script} overwrites SBT_OPTS "
+                        f"(clobbers -Dmaven.repo.local). Cannot patch external source dir. "
+                        f"Build may fall back to ~/.m2 for this project."
+                    )
+            self._debug("_patch_sbt_for_temp_repo: skipping external dir", project_dir)
+            return
+
+        m2_url = f"file://{self._m2_repo.resolve()}"
+
+        # 1. Patch build/sbt: preserve existing SBT_OPTS
+        sbt_script = project_dir / "build" / "sbt"
+        if sbt_script.exists():
+            content = sbt_script.read_text()
+            old = 'export SBT_OPTS="-D'
+            new = 'export SBT_OPTS="${SBT_OPTS} -D'
+            if old in content and new not in content:
+                content = content.replace(old, new)
+                sbt_script.write_text(content)
+                self._debug("_patch_sbt_for_temp_repo: patched SBT_OPTS in", sbt_script)
+
+        # 2. Patch sbt-config/repositories: add temp repo as highest-priority Maven source
+        repos_config = project_dir / "build" / "sbt-config" / "repositories"
+        if repos_config.exists():
+            content = repos_config.read_text()
+            if m2_url not in content:
+                patched = content.replace(
+                    "[repositories]\n",
+                    f"[repositories]\n  build-local-maven: {m2_url}\n",
+                    1,
+                )
+                repos_config.write_text(patched)
+                self._debug("_patch_sbt_for_temp_repo: added", m2_url, "to", repos_config)
+
+        if self.op_config.verbose:
+            print(f"[SparkShell] Patched SBT config in {project_dir} for temp Maven repo")
+
     def _build_delta(self, delta_dir: Path):
         """
         Build Delta Lake and publish to local Maven repository.
 
-        Args:
-            delta_dir: Path to Delta repository
+        All artifacts (including delta-kernel-unitycatalog) are published to the
+        temp Maven repo (work_dir/m2_repo) so the build is reproducible.
         """
         self._debug("_build_delta: delta_dir=", delta_dir)
         print("[SparkShell] Building Delta Lake from source...")
@@ -507,45 +597,66 @@ class SparkShell:
         delta_timeout = self.op_config.build_timeout * 2
         self._debug("  delta_timeout=", delta_timeout, "seconds")
 
-        # Delta's build reads sys.props("sparkVersion"). Publish with publishM2 so artifacts go to ~/.m2;
-        # SparkShell resolves from Resolver.mavenLocal.
-        # CrossSparkVersions (~/delta): use runOnlyForReleasableSparkModules publishM2 for correct artifacts.
-        # Other Delta (e.g. murali-db/delta): use clean package publishM2.
+        # Use temp Maven repo so the build is reproducible and does not pollute ~/.m2.
+        delta_env = self._get_maven_local_env()
+
+        # CrossSparkVersions: runOnlyForReleasableSparkModules only publishes Spark-dependent
+        # modules (e.g. delta-spark_4.1). Spark-independent modules (kernel, kernel-unitycatalog,
+        # storage) are published by a full publishM2. So we run publishM2 first, then
+        # runOnlyForReleasableSparkModules publishM2 for the requested Spark version.
         spark_version = self.delta_config.spark_version
+        # Delta's CrossSparkVersions matches by fullVersion (e.g. 4.1.0) or shortVersion (e.g. 4.1).
+        # Normalize 4.1.0-SNAPSHOT -> 4.1 so it matches.
+        if spark_version and "-SNAPSHOT" in spark_version:
+            parts = spark_version.split("-")[0].split(".")
+            if len(parts) >= 2:
+                spark_version = f"{parts[0]}.{parts[1]}"
         cross_spark = (delta_dir / "project" / "CrossSparkVersions.scala").exists()
         self._debug("  spark_version=", spark_version, "cross_spark (CrossSparkVersions)=", cross_spark)
-        if cross_spark:
-            sbt_args = [str(sbt_script), f"-DsparkVersion={spark_version}", "clean", "runOnlyForReleasableSparkModules publishM2"]
-            self._debug("  using CrossSparkVersions command: runOnlyForReleasableSparkModules publishM2")
-            if self.op_config.verbose:
-                print(f"[SparkShell] Building Delta (CrossSparkVersions) with -DsparkVersion={spark_version} runOnlyForReleasableSparkModules publishM2")
-        else:
-            sbt_args = [str(sbt_script), f"-DsparkVersion={spark_version}", "clean", "package", "publishM2"]
-            self._debug("  using standard command: clean package publishM2")
-            if self.op_config.verbose:
-                print(f"[SparkShell] Building Delta with -DsparkVersion={spark_version} publishM2")
-        self._debug("  full sbt command:", " ".join(sbt_args))
+
         try:
-            self._run_command(
-                sbt_args,
-                cwd=delta_dir,
-                timeout=delta_timeout,
-                check=True,
-                force_output=True
-            )
-            # CrossSpark publish command does not always publish delta-storage.
-            # Publish it explicitly so SparkShell can resolve delta-spark transitive deps from ~/.m2.
             if cross_spark:
-                storage_args = [str(sbt_script), "storage/publishM2"]
-                self._debug("  publishing delta-storage explicitly:", " ".join(storage_args))
+                # Publish all modules (kernel, kernel-unitycatalog, storage, etc.) first.
                 if self.op_config.verbose:
-                    print("[SparkShell] Publishing Delta storage module to Maven local...")
+                    print("[SparkShell] Publishing all Delta modules (kernel, kernel-unitycatalog, storage, ...)...")
                 self._run_command(
-                    storage_args,
+                    [str(sbt_script), "clean", "publishM2"],
                     cwd=delta_dir,
                     timeout=delta_timeout,
                     check=True,
-                    force_output=True
+                    force_output=True,
+                    env=delta_env,
+                )
+                # Then publish Spark-dependent modules for the requested Spark version.
+                if self.op_config.verbose:
+                    print(f"[SparkShell] Publishing Delta Spark modules for -DsparkVersion={spark_version}...")
+                self._run_command(
+                    [str(sbt_script), f"-DsparkVersion={spark_version}", "runOnlyForReleasableSparkModules publishM2"],
+                    cwd=delta_dir,
+                    timeout=delta_timeout,
+                    check=True,
+                    force_output=True,
+                    env=delta_env,
+                )
+                # CrossSpark publish does not always publish delta-storage; publish it explicitly.
+                if self.op_config.verbose:
+                    print("[SparkShell] Publishing Delta storage module...")
+                self._run_command(
+                    [str(sbt_script), "storage/publishM2"],
+                    cwd=delta_dir,
+                    timeout=delta_timeout,
+                    check=True,
+                    force_output=True,
+                    env=delta_env,
+                )
+            else:
+                self._run_command(
+                    [str(sbt_script), f"-DsparkVersion={spark_version}", "clean", "package", "publishM2"],
+                    cwd=delta_dir,
+                    timeout=delta_timeout,
+                    check=True,
+                    force_output=True,
+                    env=delta_env,
                 )
             self._debug("_build_delta: Delta Lake build completed successfully")
             print("[SparkShell] Delta Lake build complete")
@@ -693,6 +804,8 @@ class SparkShell:
         uc_timeout = self.op_config.build_timeout
         self._debug("  uc_timeout=", uc_timeout, "command: client/publishM2 (skip docs) spark/publishM2 (Maven -> ~/.m2/repository)")
 
+        # Publish to the same temp Maven repo as Delta so SparkShell resolves from one place.
+        uc_env = self._get_maven_local_env()
         try:
             # Publish to Maven local so Coursier-based resolution in SparkShell picks up local UC builds.
             # Must publish both client and spark modules since spark depends on client.
@@ -708,7 +821,8 @@ class SparkShell:
                 cwd=uc_dir,
                 timeout=uc_timeout,
                 check=True,
-                force_output=True
+                force_output=True,
+                env=uc_env,
             )
             self._debug("_build_uc: UC build completed successfully")
             print("[SparkShell] Unity Catalog build complete")
@@ -1008,6 +1122,15 @@ class SparkShell:
         # Ensure .sbtopts is present in work_dir before building
         self._ensure_sbtopts()
 
+        # Use a temp Maven repo under work_dir so the build is reproducible and does not pollute ~/.m2.
+        self._m2_repo = self.work_dir / "m2_repo"
+        self._m2_repo.mkdir(parents=True, exist_ok=True)
+        if self.op_config.verbose:
+            print(f"[SparkShell] Maven local repo (this build only): {self._m2_repo.resolve()}")
+
+        # Patch SparkShell's own build/sbt for the temp repo
+        self._patch_sbt_for_temp_repo(self.work_dir)
+
         # Setup and build Delta from source
         if self.op_config.verbose:
             print(f"[SparkShell] Setting up Delta Lake:")
@@ -1020,6 +1143,7 @@ class SparkShell:
                 print(f"  Branch: {self.delta_config.source_branch}")
 
         delta_dir = self._setup_delta()
+        self._patch_sbt_for_temp_repo(delta_dir)
         self._build_delta(delta_dir)
         delta_version = self._get_delta_version(delta_dir)
         self._debug("build: delta_version for SparkShell sbt env:", delta_version)
@@ -1036,6 +1160,7 @@ class SparkShell:
                 print(f"  Branch: {self.uc_source_config.source_branch}")
 
         uc_dir = self._setup_uc()
+        self._patch_sbt_for_temp_repo(uc_dir)
         self._build_uc(uc_dir)
 
         # Always print version information (not just in verbose mode)
@@ -1065,13 +1190,14 @@ class SparkShell:
         # Make sbt executable
         os.chmod(sbt_script, 0o755)
 
-        # Create environment variables for SBT
+        # Create environment variables for SBT (use same temp Maven repo for resolution).
         build_env = {
             "DELTA_VERSION": delta_version,
             "DELTA_SPARK_VERSION": self.delta_config.spark_version,
             "DELTA_USE_LOCAL": "true",
             "UC_USE_LOCAL": "true"
         }
+        build_env.update(self._get_maven_local_env())
         self._debug(
             "build: SparkShell sbt env: DELTA_VERSION=",
             delta_version,
