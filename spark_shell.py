@@ -144,6 +144,7 @@ class DeltaConfig:
     source_repo: str
     source_branch: str = "master"
     spark_version: str = "4.0.1"
+    spark_dep_version: str = "4.0.0"
     source_dir: Optional[str] = None
 
     def __post_init__(self):
@@ -1195,6 +1196,7 @@ class SparkShell:
         build_env = {
             "DELTA_VERSION": delta_version,
             "DELTA_SPARK_VERSION": self.delta_config.spark_version,
+            "SPARK_VERSION": self.delta_config.spark_dep_version,
             "DELTA_USE_LOCAL": "true",
             "UC_USE_LOCAL": "true"
         }
@@ -1204,6 +1206,8 @@ class SparkShell:
             delta_version,
             "DELTA_SPARK_VERSION=",
             self.delta_config.spark_version,
+            "SPARK_VERSION=",
+            self.delta_config.spark_dep_version,
             "DELTA_USE_LOCAL=true UC_USE_LOCAL=true")
         self._debug("build: running sbt assembly from work_dir=", self.work_dir)
 

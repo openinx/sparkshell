@@ -18,6 +18,9 @@ val deltaSparkModule = deltaArtifactSuffix.map(s => s"delta-spark_" + s).getOrEl
 val deltaIcebergModule = deltaArtifactSuffix.map(s => s"delta-iceberg_" + s).getOrElse("delta-iceberg")
 val deltaSupportsIceberg = !deltaSparkVersion.startsWith("4.1") && !deltaSparkVersion.startsWith("4.2")
 
+// Spark version for the spark-sql dependency. Must match the Delta artifact's target Spark.
+val sparkVersion = sys.env.getOrElse("SPARK_VERSION", "4.0.0")
+
 // Read Unity Catalog configuration from environment
 // UC_USE_LOCAL=true: use UC from Maven Local (requires building UC first: build/sbt publishLocal)
 //    UC main branch is 0.5.0-SNAPSHOT; 0.3.0-SNAPSHOT no longer exists in the repo.
@@ -83,8 +86,8 @@ javaOptions ++= Seq(
 )
 
 libraryDependencies ++= Seq(
-  // Spark
-  "org.apache.spark" %% "spark-sql" % "4.0.0",
+  // Spark — version derived from DELTA_SPARK_VERSION or overridden via SPARK_VERSION
+  "org.apache.spark" %% "spark-sql" % sparkVersion,
 
   // Delta Lake - version configurable via DELTA_VERSION environment variable
   "io.delta" %% deltaSparkModule % deltaVersion,
