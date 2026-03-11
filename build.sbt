@@ -2,7 +2,7 @@ name := "SparkShell"
 
 version := "0.1.0"
 
-scalaVersion := "2.13.15"
+scalaVersion := sys.env.getOrElse("SCALA_VERSION", "2.13.15")
 
 // Read Delta configuration from environment
 val deltaVersion = sys.env.getOrElse("DELTA_VERSION", "4.0.0")

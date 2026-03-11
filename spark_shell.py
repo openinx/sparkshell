@@ -139,6 +139,16 @@ class SparkConfig:
 
 
 @dataclass
+class BuildConfig:
+    """Global build configuration that spans all source projects (Delta, UC, SparkShell)."""
+    scala_version: str = "2.13.15"
+
+    def get_cache_key_component(self) -> str:
+        """Get a unique string for cache key computation."""
+        return f"scala{self.scala_version}"
+
+
+@dataclass
 class DeltaConfig:
     """Delta Lake dependency configuration."""
     source_repo: str
@@ -209,7 +219,8 @@ class SparkShell:
         op_config: Optional[OpConfig] = None,
         spark_config: Optional[SparkConfig] = None,
         delta_config: Optional[DeltaConfig] = None,
-        uc_source_config: Optional[UnityCatalogSourceConfig] = None
+        uc_source_config: Optional[UnityCatalogSourceConfig] = None,
+        build_config: Optional[BuildConfig] = None
     ):
         """
         Initialize SparkShell.
@@ -223,6 +234,7 @@ class SparkShell:
             spark_config: Spark configuration (SparkConfig object)
             delta_config: Delta Lake configuration (DeltaConfig object)
             uc_source_config: Unity Catalog source config for FGAC support (UnityCatalogSourceConfig object)
+            build_config: Global build configuration (BuildConfig object)
         """
         self.source = source
         self.port = port
@@ -232,6 +244,7 @@ class SparkShell:
         self.op_config = op_config or OpConfig()
         self.spark_config = spark_config or SparkConfig()
         self.uc_config = uc_config or UCConfig()
+        self.build_config = build_config or BuildConfig()
         self.delta_config = delta_config or DeltaConfig(
             source_repo="https://github.com/delta-io/delta",
             source_branch="master"
@@ -269,6 +282,7 @@ class SparkShell:
         self._debug("  Delta branch:", self.delta_config.source_branch)
         self._debug("  Delta source_dir:", self.delta_config.source_dir)
         self._debug("  Delta spark_version:", self.delta_config.spark_version)
+        self._debug("  Scala version:", self.build_config.scala_version)
         self._debug("  UC source repo:", self.uc_source_config.source_repo)
         self._debug("  UC source branch:", self.uc_source_config.source_branch)
         self._debug("  UC source_dir:", self.uc_source_config.source_dir)
@@ -292,15 +306,17 @@ class SparkShell:
         Includes Delta and UC configuration to prevent cache collision.
         """
         source_str = str(Path(self.source).resolve()) if not self.source.startswith("http") else self.source
+        build_str = self.build_config.get_cache_key_component()
         delta_str = self.delta_config.get_cache_key_component()
         uc_str = self.uc_source_config.get_cache_key_component()
-        combined = f"{source_str}_{delta_str}_{uc_str}"
+        combined = f"{source_str}_{build_str}_{delta_str}_{uc_str}"
         source_hash = hashlib.sha256(combined.encode()).hexdigest()[:16]
 
         if self.op_config.verbose:
             print(f"[SparkShell] Cache key computation:")
             print(f"  Source: {self.source}")
             print(f"  Normalized: {source_str}")
+            print(f"  Build config: {build_str}")
             print(f"  Delta config: {delta_str}")
             print(f"  UC config: {uc_str}")
             print(f"  Combined: {combined}")
@@ -1168,7 +1184,8 @@ class SparkShell:
         # Always print version information (not just in verbose mode)
         print(f"[SparkShell] ========================================")
         print(f"[SparkShell] Build Configuration:")
-        print(f"[SparkShell]   Spark:  4.0.0")
+        print(f"[SparkShell]   Scala:  {self.build_config.scala_version}")
+        print(f"[SparkShell]   Spark:  {self.delta_config.spark_dep_version}")
         if self.delta_config.source_dir:
             print(f"[SparkShell]   Delta:  {delta_version} (source mode: local_dir)")
             print(f"[SparkShell]           path: {Path(self.delta_config.source_dir).expanduser().resolve()}")
@@ -1197,6 +1214,7 @@ class SparkShell:
             "DELTA_VERSION": delta_version,
             "DELTA_SPARK_VERSION": self.delta_config.spark_version,
             "SPARK_VERSION": self.delta_config.spark_dep_version,
+            "SCALA_VERSION": self.build_config.scala_version,
             "DELTA_USE_LOCAL": "true",
             "UC_USE_LOCAL": "true"
         }
@@ -1208,6 +1226,8 @@ class SparkShell:
             self.delta_config.spark_version,
             "SPARK_VERSION=",
             self.delta_config.spark_dep_version,
+            "SCALA_VERSION=",
+            self.build_config.scala_version,
             "DELTA_USE_LOCAL=true UC_USE_LOCAL=true")
         self._debug("build: running sbt assembly from work_dir=", self.work_dir)
 
