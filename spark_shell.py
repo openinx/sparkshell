@@ -129,6 +129,7 @@ class OpConfig:
     cleanup_on_exit: bool = True
     startup_timeout: int = 60
     build_timeout: int = 300
+    java17_fallback_path: Optional[str] = None
 
 
 @dataclass
@@ -488,15 +489,15 @@ class SparkShell:
         """
         Build env for all SBT builds (Delta, UC, SparkShell).
 
-        Sets JAVA_HOME to JDK 17 (required by Spark 4.x) and SBT_OPTS so that
+        Optionally overrides JAVA_HOME when java17_fallback_path is set (for boxes
+        where the system JDK is too old for Spark 4.x). Also sets SBT_OPTS so that
         publishM2 and resolution use a temp Maven repo under work_dir/m2_repo.
         """
         env: dict[str, str] = {}
 
-        # Spark 4.x requires JDK 17+; the system default may be JDK 11.
-        java17 = "/usr/lib/jvm/java-17-openjdk-amd64"
-        env["JAVA_HOME"] = os.environ.get("JAVA_HOME", java17)
-        env["PATH"] = os.path.join(env["JAVA_HOME"], "bin") + ":" + os.environ.get("PATH", "")
+        if self.op_config.java17_fallback_path:
+            env["JAVA_HOME"] = self.op_config.java17_fallback_path
+            env["PATH"] = os.path.join(env["JAVA_HOME"], "bin") + ":" + os.environ.get("PATH", "")
 
         if getattr(self, "_m2_repo", None) and self._m2_repo:
             m2 = str(Path(self._m2_repo).resolve())
@@ -1286,9 +1287,9 @@ class SparkShell:
         self._debug("  log_file=", log_file)
 
         # Build command with port and optional Spark configs
-        # Use Java 17 for Spark 4.0 compatibility
-        java_home = os.environ.get("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk-amd64")
-        java_cmd = os.path.join(java_home, "bin", "java")
+        server_env = self._get_maven_local_env()
+        java_home = server_env.get("JAVA_HOME", os.environ.get("JAVA_HOME", ""))
+        java_cmd = os.path.join(java_home, "bin", "java") if java_home else "java"
         cmd = [java_cmd, "-jar", str(self.jar_path), str(self.port)]
         self._debug("  JAVA_HOME=", java_home, "java_cmd=", java_cmd)
         self._debug("  full start cmd:", " ".join(cmd))
