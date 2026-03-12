@@ -98,11 +98,13 @@ libraryDependencies ++= Seq(
   "io.unitycatalog" % "unitycatalog-spark_2.13" % ucVersion,
 
   // Cloud Storage Support (S3, ADLS)
-  // Note: GCS connector removed due to protobuf version conflict
-  "org.apache.hadoop" % "hadoop-aws" % "3.4.0",
-  "org.apache.hadoop" % "hadoop-azure" % "3.4.0",
+  // Hadoop version must match Spark's transitive hadoop-common to avoid
+  // binary incompatibilities (e.g. VectoredReadUtils API changes between 3.4.x).
+  // Spark 4.0.x → Hadoop 3.4.0, Spark 4.1.x → Hadoop 3.4.1+
+  "org.apache.hadoop" % "hadoop-aws" % sys.env.getOrElse("HADOOP_VERSION", "3.4.1"),
+  "org.apache.hadoop" % "hadoop-azure" % sys.env.getOrElse("HADOOP_VERSION", "3.4.1"),
   // "com.google.cloud.bigdataoss" % "gcs-connector" % "hadoop3-2.2.22",
-  "com.amazonaws" % "aws-java-sdk-bundle" % "1.12.262",
+  "com.amazonaws" % "aws-java-sdk-bundle" % "1.12.367",
 
   // REST API
   "com.sparkjava" % "spark-core" % "2.9.4",

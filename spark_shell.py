@@ -142,10 +142,11 @@ class SparkConfig:
 class BuildConfig:
     """Global build configuration that spans all source projects (Delta, UC, SparkShell)."""
     scala_version: str = "2.13.15"
+    hadoop_version: str = ""
 
     def get_cache_key_component(self) -> str:
         """Get a unique string for cache key computation."""
-        return f"scala{self.scala_version}"
+        return f"scala{self.scala_version}_hadoop{self.hadoop_version or 'default'}"
 
 
 @dataclass
@@ -1211,12 +1212,23 @@ class SparkShell:
         # Make sbt executable
         os.chmod(sbt_script, 0o755)
 
+        # Derive Hadoop version from Spark version if not explicitly set.
+        # Spark 4.1.x ships with Hadoop 3.4.1; Spark 4.0.x with 3.4.0.
+        hadoop_version = self.build_config.hadoop_version
+        if not hadoop_version:
+            spark_dep = self.delta_config.spark_dep_version
+            if spark_dep.startswith("4.1"):
+                hadoop_version = "3.4.1"
+            else:
+                hadoop_version = "3.4.0"
+
         # Create environment variables for SBT (use same temp Maven repo for resolution).
         build_env = {
             "DELTA_VERSION": delta_version,
             "DELTA_SPARK_VERSION": self.delta_config.spark_version,
             "SPARK_VERSION": self.delta_config.spark_dep_version,
             "SCALA_VERSION": self.build_config.scala_version,
+            "HADOOP_VERSION": hadoop_version,
             "DELTA_USE_LOCAL": "true",
             "UC_USE_LOCAL": "true"
         }
