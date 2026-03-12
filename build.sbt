@@ -104,7 +104,10 @@ libraryDependencies ++= Seq(
   "org.apache.hadoop" % "hadoop-aws" % sys.env.getOrElse("HADOOP_VERSION", "3.4.1"),
   "org.apache.hadoop" % "hadoop-azure" % sys.env.getOrElse("HADOOP_VERSION", "3.4.1"),
   // "com.google.cloud.bigdataoss" % "gcs-connector" % "hadoop3-2.2.22",
-  "com.amazonaws" % "aws-java-sdk-bundle" % "1.12.367",
+  // hadoop-aws 3.4.1 uses AWS SDK v2 (compile) + v1 (provided/adapter only).
+  // Versions from hadoop-project-3.4.1.pom.
+  "software.amazon.awssdk" % "bundle" % "2.24.6",
+  "com.amazonaws" % "aws-java-sdk-bundle" % "1.12.720",
 
   // REST API
   "com.sparkjava" % "spark-core" % "2.9.4",
