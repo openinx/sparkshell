@@ -129,6 +129,7 @@ class OpConfig:
     cleanup_on_exit: bool = True
     startup_timeout: int = 60
     build_timeout: int = 300
+    java17_fallback_path: Optional[str] = None
 
 
 @dataclass
@@ -138,11 +139,23 @@ class SparkConfig:
 
 
 @dataclass
+class BuildConfig:
+    """Global build configuration that spans all source projects (Delta, UC, SparkShell)."""
+    scala_version: str = "2.13.15"
+    hadoop_version: str = ""
+
+    def get_cache_key_component(self) -> str:
+        """Get a unique string for cache key computation."""
+        return f"scala{self.scala_version}_hadoop{self.hadoop_version or 'default'}"
+
+
+@dataclass
 class DeltaConfig:
     """Delta Lake dependency configuration."""
     source_repo: str
     source_branch: str = "master"
     spark_version: str = "4.0.1"
+    spark_dep_version: str = "4.0.0"
     source_dir: Optional[str] = None
 
     def __post_init__(self):
@@ -207,7 +220,8 @@ class SparkShell:
         op_config: Optional[OpConfig] = None,
         spark_config: Optional[SparkConfig] = None,
         delta_config: Optional[DeltaConfig] = None,
-        uc_source_config: Optional[UnityCatalogSourceConfig] = None
+        uc_source_config: Optional[UnityCatalogSourceConfig] = None,
+        build_config: Optional[BuildConfig] = None
     ):
         """
         Initialize SparkShell.
@@ -221,6 +235,7 @@ class SparkShell:
             spark_config: Spark configuration (SparkConfig object)
             delta_config: Delta Lake configuration (DeltaConfig object)
             uc_source_config: Unity Catalog source config for FGAC support (UnityCatalogSourceConfig object)
+            build_config: Global build configuration (BuildConfig object)
         """
         self.source = source
         self.port = port
@@ -230,6 +245,7 @@ class SparkShell:
         self.op_config = op_config or OpConfig()
         self.spark_config = spark_config or SparkConfig()
         self.uc_config = uc_config or UCConfig()
+        self.build_config = build_config or BuildConfig()
         self.delta_config = delta_config or DeltaConfig(
             source_repo="https://github.com/delta-io/delta",
             source_branch="master"
@@ -250,6 +266,8 @@ class SparkShell:
         self.process: Optional[subprocess.Popen] = None
         self.jar_path: Optional[Path] = None
         self.is_ready = False
+        self._log_handle = None
+        self._log_thread = None
 
         # Tee: all print output is also written to a log file
         self._original_stdout: Optional[object] = None
@@ -267,6 +285,7 @@ class SparkShell:
         self._debug("  Delta branch:", self.delta_config.source_branch)
         self._debug("  Delta source_dir:", self.delta_config.source_dir)
         self._debug("  Delta spark_version:", self.delta_config.spark_version)
+        self._debug("  Scala version:", self.build_config.scala_version)
         self._debug("  UC source repo:", self.uc_source_config.source_repo)
         self._debug("  UC source branch:", self.uc_source_config.source_branch)
         self._debug("  UC source_dir:", self.uc_source_config.source_dir)
@@ -290,15 +309,17 @@ class SparkShell:
         Includes Delta and UC configuration to prevent cache collision.
         """
         source_str = str(Path(self.source).resolve()) if not self.source.startswith("http") else self.source
+        build_str = self.build_config.get_cache_key_component()
         delta_str = self.delta_config.get_cache_key_component()
         uc_str = self.uc_source_config.get_cache_key_component()
-        combined = f"{source_str}_{delta_str}_{uc_str}"
+        combined = f"{source_str}_{build_str}_{delta_str}_{uc_str}"
         source_hash = hashlib.sha256(combined.encode()).hexdigest()[:16]
 
         if self.op_config.verbose:
             print(f"[SparkShell] Cache key computation:")
             print(f"  Source: {self.source}")
             print(f"  Normalized: {source_str}")
+            print(f"  Build config: {build_str}")
             print(f"  Delta config: {delta_str}")
             print(f"  UC config: {uc_str}")
             print(f"  Combined: {combined}")
@@ -484,12 +505,102 @@ class SparkShell:
         print(f"[SparkShell] Delta repository ready: {delta_dir}")
         return delta_dir
 
+    def _get_maven_local_env(self) -> dict:
+        """
+        Build env for all SBT builds (Delta, UC, SparkShell).
+
+        Optionally overrides JAVA_HOME when java17_fallback_path is set (for boxes
+        where the system JDK is too old for Spark 4.x). Also sets SBT_OPTS so that
+        publishM2 and resolution use a temp Maven repo under work_dir/m2_repo.
+        """
+        env: dict[str, str] = {}
+
+        if self.op_config.java17_fallback_path:
+            env["JAVA_HOME"] = self.op_config.java17_fallback_path
+            env["PATH"] = os.path.join(env["JAVA_HOME"], "bin") + ":" + os.environ.get("PATH", "")
+
+        if getattr(self, "_m2_repo", None) and self._m2_repo:
+            m2 = str(Path(self._m2_repo).resolve())
+            opts = os.environ.get("SBT_OPTS", "")
+            if "-Dmaven.repo.local=" not in opts:
+                opts = f"{opts} -Dmaven.repo.local={m2}".strip()
+            env["SBT_OPTS"] = opts
+
+        return env
+
+    def _patch_sbt_for_temp_repo(self, project_dir: Path):
+        """
+        Patch a project's build/sbt so all publishM2 and resolution uses the temp repo.
+
+        Many build/sbt scripts (from Delta, SparkShell) unconditionally overwrite SBT_OPTS,
+        destroying -Dmaven.repo.local set by _get_maven_local_env(). Additionally, they set
+        -Dsbt.override.build.repos=true which ignores build.sbt resolvers.
+
+        This method fixes both issues for any project dir that has build/sbt:
+        1. Patches build/sbt to append to SBT_OPTS instead of overwriting.
+        2. Injects the temp Maven repo into sbt-config/repositories.
+
+        Only patches directories under work_dir (temp copies we own). User-provided
+        source_dir paths are never modified; a warning is emitted if a clobbering
+        pattern is detected there.
+        """
+        if not getattr(self, "_m2_repo", None) or not self._m2_repo:
+            return
+        if not self.work_dir:
+            return
+
+        project_dir = Path(project_dir).resolve()
+        work_dir_resolved = Path(self.work_dir).resolve()
+
+        # Safety: never modify files outside our temp work_dir.
+        if not str(project_dir).startswith(str(work_dir_resolved)):
+            sbt_script = project_dir / "build" / "sbt"
+            if sbt_script.exists():
+                content = sbt_script.read_text()
+                if 'export SBT_OPTS="-D' in content and '${SBT_OPTS}' not in content:
+                    print(
+                        f"[SparkShell] WARNING: {sbt_script} overwrites SBT_OPTS "
+                        f"(clobbers -Dmaven.repo.local). Cannot patch external source dir. "
+                        f"Build may fall back to ~/.m2 for this project."
+                    )
+            self._debug("_patch_sbt_for_temp_repo: skipping external dir", project_dir)
+            return
+
+        m2_url = f"file://{self._m2_repo.resolve()}"
+
+        # 1. Patch build/sbt: preserve existing SBT_OPTS
+        sbt_script = project_dir / "build" / "sbt"
+        if sbt_script.exists():
+            content = sbt_script.read_text()
+            old = 'export SBT_OPTS="-D'
+            new = 'export SBT_OPTS="${SBT_OPTS} -D'
+            if old in content and new not in content:
+                content = content.replace(old, new)
+                sbt_script.write_text(content)
+                self._debug("_patch_sbt_for_temp_repo: patched SBT_OPTS in", sbt_script)
+
+        # 2. Patch sbt-config/repositories: add temp repo as highest-priority Maven source
+        repos_config = project_dir / "build" / "sbt-config" / "repositories"
+        if repos_config.exists():
+            content = repos_config.read_text()
+            if m2_url not in content:
+                patched = content.replace(
+                    "[repositories]\n",
+                    f"[repositories]\n  build-local-maven: {m2_url}\n",
+                    1,
+                )
+                repos_config.write_text(patched)
+                self._debug("_patch_sbt_for_temp_repo: added", m2_url, "to", repos_config)
+
+        if self.op_config.verbose:
+            print(f"[SparkShell] Patched SBT config in {project_dir} for temp Maven repo")
+
     def _build_delta(self, delta_dir: Path):
         """
         Build Delta Lake and publish to local Maven repository.
 
-        Args:
-            delta_dir: Path to Delta repository
+        All artifacts (including delta-kernel-unitycatalog) are published to the
+        temp Maven repo (work_dir/m2_repo) so the build is reproducible.
         """
         self._debug("_build_delta: delta_dir=", delta_dir)
         print("[SparkShell] Building Delta Lake from source...")
@@ -507,45 +618,66 @@ class SparkShell:
         delta_timeout = self.op_config.build_timeout * 2
         self._debug("  delta_timeout=", delta_timeout, "seconds")
 
-        # Delta's build reads sys.props("sparkVersion"). Publish with publishM2 so artifacts go to ~/.m2;
-        # SparkShell resolves from Resolver.mavenLocal.
-        # CrossSparkVersions (~/delta): use runOnlyForReleasableSparkModules publishM2 for correct artifacts.
-        # Other Delta (e.g. murali-db/delta): use clean package publishM2.
+        # Use temp Maven repo so the build is reproducible and does not pollute ~/.m2.
+        delta_env = self._get_maven_local_env()
+
+        # CrossSparkVersions: runOnlyForReleasableSparkModules only publishes Spark-dependent
+        # modules (e.g. delta-spark_4.1). Spark-independent modules (kernel, kernel-unitycatalog,
+        # storage) are published by a full publishM2. So we run publishM2 first, then
+        # runOnlyForReleasableSparkModules publishM2 for the requested Spark version.
         spark_version = self.delta_config.spark_version
+        # Delta's CrossSparkVersions matches by fullVersion (e.g. 4.1.0) or shortVersion (e.g. 4.1).
+        # Normalize 4.1.0-SNAPSHOT -> 4.1 so it matches.
+        if spark_version and "-SNAPSHOT" in spark_version:
+            parts = spark_version.split("-")[0].split(".")
+            if len(parts) >= 2:
+                spark_version = f"{parts[0]}.{parts[1]}"
         cross_spark = (delta_dir / "project" / "CrossSparkVersions.scala").exists()
         self._debug("  spark_version=", spark_version, "cross_spark (CrossSparkVersions)=", cross_spark)
-        if cross_spark:
-            sbt_args = [str(sbt_script), f"-DsparkVersion={spark_version}", "clean", "runOnlyForReleasableSparkModules publishM2"]
-            self._debug("  using CrossSparkVersions command: runOnlyForReleasableSparkModules publishM2")
-            if self.op_config.verbose:
-                print(f"[SparkShell] Building Delta (CrossSparkVersions) with -DsparkVersion={spark_version} runOnlyForReleasableSparkModules publishM2")
-        else:
-            sbt_args = [str(sbt_script), f"-DsparkVersion={spark_version}", "clean", "package", "publishM2"]
-            self._debug("  using standard command: clean package publishM2")
-            if self.op_config.verbose:
-                print(f"[SparkShell] Building Delta with -DsparkVersion={spark_version} publishM2")
-        self._debug("  full sbt command:", " ".join(sbt_args))
+
         try:
-            self._run_command(
-                sbt_args,
-                cwd=delta_dir,
-                timeout=delta_timeout,
-                check=True,
-                force_output=True
-            )
-            # CrossSpark publish command does not always publish delta-storage.
-            # Publish it explicitly so SparkShell can resolve delta-spark transitive deps from ~/.m2.
             if cross_spark:
-                storage_args = [str(sbt_script), "storage/publishM2"]
-                self._debug("  publishing delta-storage explicitly:", " ".join(storage_args))
+                # Publish all modules (kernel, kernel-unitycatalog, storage, etc.) first.
                 if self.op_config.verbose:
-                    print("[SparkShell] Publishing Delta storage module to Maven local...")
+                    print("[SparkShell] Publishing all Delta modules (kernel, kernel-unitycatalog, storage, ...)...")
                 self._run_command(
-                    storage_args,
+                    [str(sbt_script), "clean", "publishM2"],
                     cwd=delta_dir,
                     timeout=delta_timeout,
                     check=True,
-                    force_output=True
+                    force_output=True,
+                    env=delta_env,
+                )
+                # Then publish Spark-dependent modules for the requested Spark version.
+                if self.op_config.verbose:
+                    print(f"[SparkShell] Publishing Delta Spark modules for -DsparkVersion={spark_version}...")
+                self._run_command(
+                    [str(sbt_script), f"-DsparkVersion={spark_version}", "runOnlyForReleasableSparkModules publishM2"],
+                    cwd=delta_dir,
+                    timeout=delta_timeout,
+                    check=True,
+                    force_output=True,
+                    env=delta_env,
+                )
+                # CrossSpark publish does not always publish delta-storage; publish it explicitly.
+                if self.op_config.verbose:
+                    print("[SparkShell] Publishing Delta storage module...")
+                self._run_command(
+                    [str(sbt_script), "storage/publishM2"],
+                    cwd=delta_dir,
+                    timeout=delta_timeout,
+                    check=True,
+                    force_output=True,
+                    env=delta_env,
+                )
+            else:
+                self._run_command(
+                    [str(sbt_script), f"-DsparkVersion={spark_version}", "clean", "package", "publishM2"],
+                    cwd=delta_dir,
+                    timeout=delta_timeout,
+                    check=True,
+                    force_output=True,
+                    env=delta_env,
                 )
             self._debug("_build_delta: Delta Lake build completed successfully")
             print("[SparkShell] Delta Lake build complete")
@@ -693,6 +825,8 @@ class SparkShell:
         uc_timeout = self.op_config.build_timeout
         self._debug("  uc_timeout=", uc_timeout, "command: client/publishM2 (skip docs) spark/publishM2 (Maven -> ~/.m2/repository)")
 
+        # Publish to the same temp Maven repo as Delta so SparkShell resolves from one place.
+        uc_env = self._get_maven_local_env()
         try:
             # Publish to Maven local so Coursier-based resolution in SparkShell picks up local UC builds.
             # Must publish both client and spark modules since spark depends on client.
@@ -708,7 +842,8 @@ class SparkShell:
                 cwd=uc_dir,
                 timeout=uc_timeout,
                 check=True,
-                force_output=True
+                force_output=True,
+                env=uc_env,
             )
             self._debug("_build_uc: UC build completed successfully")
             print("[SparkShell] Unity Catalog build complete")
@@ -1008,6 +1143,15 @@ class SparkShell:
         # Ensure .sbtopts is present in work_dir before building
         self._ensure_sbtopts()
 
+        # Use a temp Maven repo under work_dir so the build is reproducible and does not pollute ~/.m2.
+        self._m2_repo = self.work_dir / "m2_repo"
+        self._m2_repo.mkdir(parents=True, exist_ok=True)
+        if self.op_config.verbose:
+            print(f"[SparkShell] Maven local repo (this build only): {self._m2_repo.resolve()}")
+
+        # Patch SparkShell's own build/sbt for the temp repo
+        self._patch_sbt_for_temp_repo(self.work_dir)
+
         # Setup and build Delta from source
         if self.op_config.verbose:
             print(f"[SparkShell] Setting up Delta Lake:")
@@ -1020,6 +1164,7 @@ class SparkShell:
                 print(f"  Branch: {self.delta_config.source_branch}")
 
         delta_dir = self._setup_delta()
+        self._patch_sbt_for_temp_repo(delta_dir)
         self._build_delta(delta_dir)
         delta_version = self._get_delta_version(delta_dir)
         self._debug("build: delta_version for SparkShell sbt env:", delta_version)
@@ -1036,12 +1181,14 @@ class SparkShell:
                 print(f"  Branch: {self.uc_source_config.source_branch}")
 
         uc_dir = self._setup_uc()
+        self._patch_sbt_for_temp_repo(uc_dir)
         self._build_uc(uc_dir)
 
         # Always print version information (not just in verbose mode)
         print(f"[SparkShell] ========================================")
         print(f"[SparkShell] Build Configuration:")
-        print(f"[SparkShell]   Spark:  4.0.0")
+        print(f"[SparkShell]   Scala:  {self.build_config.scala_version}")
+        print(f"[SparkShell]   Spark:  {self.delta_config.spark_dep_version}")
         if self.delta_config.source_dir:
             print(f"[SparkShell]   Delta:  {delta_version} (source mode: local_dir)")
             print(f"[SparkShell]           path: {Path(self.delta_config.source_dir).expanduser().resolve()}")
@@ -1065,18 +1212,36 @@ class SparkShell:
         # Make sbt executable
         os.chmod(sbt_script, 0o755)
 
-        # Create environment variables for SBT
+        # Derive Hadoop version from Spark version if not explicitly set.
+        # Spark 4.1.x ships with Hadoop 3.4.1; Spark 4.0.x with 3.4.0.
+        hadoop_version = self.build_config.hadoop_version
+        if not hadoop_version:
+            spark_dep = self.delta_config.spark_dep_version
+            if spark_dep.startswith("4.1"):
+                hadoop_version = "3.4.1"
+            else:
+                hadoop_version = "3.4.0"
+
+        # Create environment variables for SBT (use same temp Maven repo for resolution).
         build_env = {
             "DELTA_VERSION": delta_version,
             "DELTA_SPARK_VERSION": self.delta_config.spark_version,
+            "SPARK_VERSION": self.delta_config.spark_dep_version,
+            "SCALA_VERSION": self.build_config.scala_version,
+            "HADOOP_VERSION": hadoop_version,
             "DELTA_USE_LOCAL": "true",
             "UC_USE_LOCAL": "true"
         }
+        build_env.update(self._get_maven_local_env())
         self._debug(
             "build: SparkShell sbt env: DELTA_VERSION=",
             delta_version,
             "DELTA_SPARK_VERSION=",
             self.delta_config.spark_version,
+            "SPARK_VERSION=",
+            self.delta_config.spark_dep_version,
+            "SCALA_VERSION=",
+            self.build_config.scala_version,
             "DELTA_USE_LOCAL=true UC_USE_LOCAL=true")
         self._debug("build: running sbt assembly from work_dir=", self.work_dir)
 
@@ -1160,9 +1325,9 @@ class SparkShell:
         self._debug("  log_file=", log_file)
 
         # Build command with port and optional Spark configs
-        # Use Java 17 for Spark 4.0 compatibility
-        java_home = os.environ.get("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk-amd64")
-        java_cmd = os.path.join(java_home, "bin", "java")
+        server_env = self._get_maven_local_env()
+        java_home = server_env.get("JAVA_HOME", os.environ.get("JAVA_HOME", ""))
+        java_cmd = os.path.join(java_home, "bin", "java") if java_home else "java"
         cmd = [java_cmd, "-jar", str(self.jar_path), str(self.port)]
         self._debug("  JAVA_HOME=", java_home, "java_cmd=", java_cmd)
         self._debug("  full start cmd:", " ".join(cmd))
@@ -1176,28 +1341,41 @@ class SparkShell:
         if self.op_config.verbose:
             print(f"[SparkShell] Running: {' '.join(cmd)}")
 
-        # Always write to log file for diagnostics, but also show in verbose mode
-        with open(log_file, "w") as log:
-            if self.op_config.verbose:
-                # In verbose mode, use Popen to read output continuously
-                self.process = subprocess.Popen(
-                    cmd,
-                    cwd=self.work_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    preexec_fn=os.setsid if sys.platform != "win32" else None
-                )
-            else:
-                # In quiet mode, redirect to log file only
-                self.process = subprocess.Popen(
-                    cmd,
-                    cwd=self.work_dir,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    preexec_fn=os.setsid if sys.platform != "win32" else None
-                )
+        # Keep the log file open for the lifetime of the server process so
+        # output is always captured.  A background thread drains stdout so
+        # the OS pipe buffer never fills up (which would block the JVM).
+        import threading
+
+        self._log_handle = open(log_file, "w")
+
+        self.process = subprocess.Popen(
+            cmd,
+            cwd=self.work_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            preexec_fn=os.setsid if sys.platform != "win32" else None,
+        )
+
+        def _drain_stdout():
+            """Continuously read server stdout, write to log file (and print in verbose mode)."""
+            try:
+                for line in self.process.stdout:
+                    self._log_handle.write(line)
+                    self._log_handle.flush()
+                    if self.op_config.verbose:
+                        print(line, end='')
+            except (ValueError, OSError):
+                pass
+            finally:
+                try:
+                    self._log_handle.close()
+                except (ValueError, OSError):
+                    pass
+
+        self._log_thread = threading.Thread(target=_drain_stdout, daemon=True)
+        self._log_thread.start()
 
         # Wait for server to be ready
         self._debug("start: waiting up to", self.op_config.startup_timeout, "s for server")
@@ -1205,27 +1383,6 @@ class SparkShell:
         start_time = time.time()
 
         while time.time() - start_time < self.op_config.startup_timeout:
-            # In verbose mode, read and display output from the process
-            if self.op_config.verbose and self.process.stdout:
-                try:
-                    import select
-                    # Use select to check if there's data to read (non-blocking)
-                    if sys.platform != "win32":
-                        ready, _, _ = select.select([self.process.stdout], [], [], 0.1)
-                        if ready:
-                            line = self.process.stdout.readline()
-                            if line:
-                                print(line, end='')
-                                # Also write to log file
-                                with open(log_file, "a") as log:
-                                    log.write(line)
-                    else:
-                        # Windows doesn't support select on pipes, use readline with timeout
-                        # This is a simplified approach for Windows
-                        pass
-                except:
-                    pass
-
             if self._check_health():
                 self.is_ready = True
                 self._debug("start: server health check passed, is_ready=True")
@@ -1403,6 +1560,15 @@ class SparkShell:
         except Exception as e:
             print(f"[SparkShell] Error during shutdown: {e}")
         finally:
+            if hasattr(self, '_log_thread') and self._log_thread is not None:
+                self._log_thread.join(timeout=5)
+                self._log_thread = None
+            if hasattr(self, '_log_handle') and self._log_handle is not None:
+                try:
+                    self._log_handle.close()
+                except (ValueError, OSError):
+                    pass
+                self._log_handle = None
             self.process = None
             self.is_ready = False
     

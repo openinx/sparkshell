@@ -2,16 +2,24 @@ name := "SparkShell"
 
 version := "0.1.0"
 
-scalaVersion := "2.13.15"
+scalaVersion := sys.env.getOrElse("SCALA_VERSION", "2.13.15")
 
 // Read Delta configuration from environment
 val deltaVersion = sys.env.getOrElse("DELTA_VERSION", "4.0.0")
 val deltaUseLocal = sys.env.getOrElse("DELTA_USE_LOCAL", "false").toBoolean
 val deltaSparkVersion = sys.env.getOrElse("DELTA_SPARK_VERSION", "")
-val deltaArtifactSuffix = if (deltaSparkVersion.startsWith("4.0")) Some("4.0") else None
+// Delta CrossSparkVersions publishes delta-spark_4.0_2.13, delta-spark_4.1_2.13, etc.
+val deltaArtifactSuffix =
+  if (deltaSparkVersion.startsWith("4.2")) Some("4.2")
+  else if (deltaSparkVersion.startsWith("4.1")) Some("4.1")
+  else if (deltaSparkVersion.startsWith("4.0")) Some("4.0")
+  else None
 val deltaSparkModule = deltaArtifactSuffix.map(s => s"delta-spark_" + s).getOrElse("delta-spark")
 val deltaIcebergModule = deltaArtifactSuffix.map(s => s"delta-iceberg_" + s).getOrElse("delta-iceberg")
 val deltaSupportsIceberg = !deltaSparkVersion.startsWith("4.1") && !deltaSparkVersion.startsWith("4.2")
+
+// Spark version for the spark-sql dependency. Must match the Delta artifact's target Spark.
+val sparkVersion = sys.env.getOrElse("SPARK_VERSION", "4.0.0")
 
 // Read Unity Catalog configuration from environment
 // UC_USE_LOCAL=true: use UC from Maven Local (requires building UC first: build/sbt publishLocal)
@@ -20,11 +28,14 @@ val deltaSupportsIceberg = !deltaSparkVersion.startsWith("4.1") && !deltaSparkVe
 val ucUseLocal = sys.env.getOrElse("UC_USE_LOCAL", "false").toBoolean
 val ucVersion = if (ucUseLocal) "0.5.0-SNAPSHOT" else "0.3.1"
 
-// When using local Delta or UC: include Maven local so ~/.m2 snapshots are available.
-// Both Delta and UC publish to ~/.m2 via publishM2.
-// Keep it after normal repositories to avoid shadowing stable transitive dependencies.
+// When using local Delta or UC: resolve from Maven local. Use maven.repo.local when set
+// (e.g. by SparkShell for a temp repo under work_dir/m2_repo) so the build is reproducible.
 val needsMavenLocal = deltaUseLocal || ucUseLocal
-resolvers := resolvers.value ++ (if (needsMavenLocal) Seq(Resolver.mavenLocal) else Seq.empty)
+val localMavenRepo =
+  sys.props.get("maven.repo.local").fold(Resolver.mavenLocal)(p =>
+    MavenRepository("local", "file://" + new java.io.File(p).getAbsolutePath)
+  )
+resolvers := resolvers.value ++ (if (needsMavenLocal) Seq(localMavenRepo) else Seq.empty)
 
 // Main class for easy running
 Compile / mainClass := Some("com.sparkshell.SparkShellServer")
@@ -75,8 +86,8 @@ javaOptions ++= Seq(
 )
 
 libraryDependencies ++= Seq(
-  // Spark
-  "org.apache.spark" %% "spark-sql" % "4.0.0",
+  // Spark — version derived from DELTA_SPARK_VERSION or overridden via SPARK_VERSION
+  "org.apache.spark" %% "spark-sql" % sparkVersion,
 
   // Delta Lake - version configurable via DELTA_VERSION environment variable
   "io.delta" %% deltaSparkModule % deltaVersion,
@@ -87,11 +98,16 @@ libraryDependencies ++= Seq(
   "io.unitycatalog" % "unitycatalog-spark_2.13" % ucVersion,
 
   // Cloud Storage Support (S3, ADLS)
-  // Note: GCS connector removed due to protobuf version conflict
-  "org.apache.hadoop" % "hadoop-aws" % "3.4.0",
-  "org.apache.hadoop" % "hadoop-azure" % "3.4.0",
+  // Hadoop version must match Spark's transitive hadoop-common to avoid
+  // binary incompatibilities (e.g. VectoredReadUtils API changes between 3.4.x).
+  // Spark 4.0.x → Hadoop 3.4.0, Spark 4.1.x → Hadoop 3.4.1+
+  "org.apache.hadoop" % "hadoop-aws" % sys.env.getOrElse("HADOOP_VERSION", "3.4.1"),
+  "org.apache.hadoop" % "hadoop-azure" % sys.env.getOrElse("HADOOP_VERSION", "3.4.1"),
   // "com.google.cloud.bigdataoss" % "gcs-connector" % "hadoop3-2.2.22",
-  "com.amazonaws" % "aws-java-sdk-bundle" % "1.12.262",
+  // hadoop-aws 3.4.1 uses AWS SDK v2 (compile) + v1 (provided/adapter only).
+  // Versions from hadoop-project-3.4.1.pom.
+  "software.amazon.awssdk" % "bundle" % "2.24.6",
+  "com.amazonaws" % "aws-java-sdk-bundle" % "1.12.720",
 
   // REST API
   "com.sparkjava" % "spark-core" % "2.9.4",

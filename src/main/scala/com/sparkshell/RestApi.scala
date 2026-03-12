@@ -9,6 +9,16 @@ class RestApi(sparkSession: SparkSession, port: Int) {
   private val gson = new Gson()
   private val executor = new SparkSqlExecutor(sparkSession)
 
+  /**
+   * Non-blocking log: writes to stderr to avoid contention with Log4j's
+   * ConsoleAppender which holds the System.out PrintStream lock.  If the
+   * stdout pipe buffer is full (common when the parent process doesn't drain
+   * it fast enough), any thread calling System.out.println blocks in the
+   * kernel AND holds the PrintStream ReentrantLock, deadlocking every other
+   * thread that tries to print — including HTTP handler threads.
+   */
+  private def log(msg: String): Unit = System.err.println(msg)
+
   def start(): Unit = {
     // Set port
     Spark.port(port)
@@ -43,11 +53,11 @@ class RestApi(sparkSession: SparkSession, port: Int) {
           ))
         } else {
 
-          println(s"Executing SQL: ${sqlRequest.sql}")
+          log(s"Executing SQL: ${sqlRequest.sql}")
           
           // Convert Java null to Scala Option
           val outputPathOpt = Option(sqlRequest.outputPath)
-          outputPathOpt.foreach(path => println(s"Output path: $path"))
+          outputPathOpt.foreach(path => log(s"Output path: $path"))
           
           val result = executor.executeSql(sqlRequest.sql, outputPathOpt)
 
@@ -100,11 +110,11 @@ class RestApi(sparkSession: SparkSession, port: Int) {
 
     // Wait for initialization
     Spark.awaitInitialization()
-    println(s"REST API server started on port $port")
-    println(s"Available endpoints:")
-    println(s"  GET  http://localhost:$port/health - Health check")
-    println(s"  GET  http://localhost:$port/info - Server info")
-    println(s"  POST http://localhost:$port/sql - Execute SQL")
+    log(s"REST API server started on port $port")
+    log(s"Available endpoints:")
+    log(s"  GET  http://localhost:$port/health - Health check")
+    log(s"  GET  http://localhost:$port/info - Server info")
+    log(s"  POST http://localhost:$port/sql - Execute SQL")
   }
 
   def stop(): Unit = {
